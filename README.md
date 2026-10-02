@@ -1,4 +1,5 @@
 # SimpleFPS
+<img width="510" height="680" alt="image" src="https://github.com/user-attachments/assets/1f62bce6-df23-4b37-8c7f-b669290ebb9f" />
 
 The frame rate of the running game, as a plain number in the top left corner of the screen, on a
 jailbroken PS5 with system software 13.60.
