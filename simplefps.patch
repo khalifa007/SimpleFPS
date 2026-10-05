@@ -1,6 +1,103 @@
+--- a/include/common_fps/config.hpp
++++ b/include/common_fps/config.hpp
+@@ -7,14 +7,22 @@
+ 
+ #pragma once
+ #include "common_fps/types.hpp"
+-#include <string>
+ #include <string_view>
+ 
+ namespace common_fps {
+ 
+ OverlayConfig default_config();
++
++/*
++ * Reads "key=value" lines. Unknown keys and bad values keep the default, so a
++ * half-edited file never produces anything worse than the default overlay.
++ */
+ OverlayConfig parse_config_text(std::string_view text);
+-std::string serialize_config(const OverlayConfig& cfg);
++
++/* The settings file written on first run, with every key and its choices. */
++const char* default_config_text();
++
+ const char* corner_name(Corner corner);
++const char* item_name(OverlayItem item);
+ 
+ } // namespace common_fps
+--- a/include/common_fps/layout.hpp
++++ b/include/common_fps/layout.hpp
+@@ -12,4 +12,22 @@ namespace common_fps {
+ 
+ Vec2 compute_anchor(const OverlayConfig& cfg);
+ 
++struct RowPosition {
++    float label_x{};
++    float value_x{};
++    float y{};
++};
++
++/* Estimated width of one line of text, in logical pixels. */
++float estimate_text_width(const char* text, int font_size);
++
++/*
++ * Where each row of the frame goes; out holds kMaxOverlayRows entries.
++ * Names form a column on the left and their values end on a shared right
++ * edge; a line without a name among them starts where the names start.
++ * With no names at all, values start at the anchor in the left corners and
++ * end at the margin in the right corners.
++ */
++void compute_row_positions(const OverlayFrame& frame, RowPosition* out);
++
+ } // namespace common_fps
+--- /dev/null
++++ b/include/common_fps/overlay_rows.hpp
+@@ -0,0 +1,42 @@
++/*
++ * SimpleFPS addition to Common FPS for PS5
++ *
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++#pragma once
++#include "common_fps/types.hpp"
++
++#include <cstdint>
++
++namespace common_fps {
++
++/* Lowest, highest and average FPS since the last reset. */
++class FpsStats {
++public:
++    void reset() noexcept { *this = FpsStats{}; }
++    void add(int fps) noexcept;
++
++    bool empty() const noexcept { return count_ == 0; }
++    int min() const noexcept { return min_; }
++    int max() const noexcept { return max_; }
++    int average() const noexcept;
++
++private:
++    std::uint64_t sum_ = 0;
++    std::uint64_t count_ = 0;
++    int min_ = 0;
++    int max_ = 0;
++};
++
++struct OverlayReadings {
++    bool have_fps = false;
++    int fps = 0;
++    FpsStats stats{};
++    std::uint64_t session_seconds = 0;
++};
++
++/* Fills frame.rows and frame.row_count from frame.config and the readings. */
++void build_overlay_rows(OverlayFrame& frame, const OverlayReadings& readings);
++
++} // namespace common_fps
 --- a/include/common_fps/shellui_hook_protocol.hpp
 +++ b/include/common_fps/shellui_hook_protocol.hpp
-@@ -70,11 +70,12 @@
+@@ -70,11 +70,12 @@ inline ShellUiHookBackend shellui_main_thread_guard_backend(
       * chain path; returning Unsupported here selects that existing backend.
       */
      if ((family >= 0x01000000U && family <= 0x08200000U) ||
@@ -15,7 +112,7 @@
          return ShellUiHookBackend::PtraceIo;
      return ShellUiHookBackend::Unsupported;
  }
-@@ -269,9 +270,10 @@
+@@ -269,9 +270,10 @@ inline ShellUiHookBackend shellui_hook_probe_backend(
      std::uint32_t sdk) noexcept {
      const std::uint32_t family = sdk & 0xffff0000U;
      if ((family >= 0x01000000U && family <= 0x08200000U) ||
@@ -30,18 +127,84 @@
  }
 --- a/include/common_fps/types.hpp
 +++ b/include/common_fps/types.hpp
-@@ -26,7 +26,7 @@
+@@ -6,6 +6,7 @@
+  */
+ 
+ #pragma once
++#include <cstddef>
+ #include <cstdint>
+ #include <string>
+ 
+@@ -25,11 +26,47 @@ struct Vec2 {
+     float y{};
  };
  
++/* One line of the overlay, top to bottom in the order of "show=". */
++enum class OverlayItem : std::uint8_t {
++    Fps,
++    FrameTime,
++    Min,
++    Max,
++    Avg,
++    Time,
++};
++
++enum class LabelMode : std::uint8_t {
++    Auto, // names when more than one line is shown, never on the fps line
++    On,
++    Off,
++};
++
++inline constexpr std::size_t kMaxOverlayRows = 8;
++inline constexpr std::size_t kOverlayLabelSize = 8;
++inline constexpr std::size_t kOverlayValueSize = 16;
++
  struct OverlayConfig {
 -    Corner corner = Corner::BottomLeft;
 +    Corner corner = Corner::TopLeft;
      int font_size = 24;
      float margin_x = 10.0f;
      float margin_y = 10.0f;
++
++    bool visible = true;
++    OverlayItem items[kMaxOverlayRows] = {OverlayItem::Fps};
++    std::size_t item_count = 1;
++    LabelMode labels = LabelMode::Auto;
++    bool color = false;
++    int fps_good = 55;
++    int fps_ok = 30;
++};
++
++/* Text and 0xRRGGBBAA colours, ready to draw. An empty label draws nothing. */
++struct OverlayRow {
++    char label[kOverlayLabelSize]{};
++    char value[kOverlayValueSize]{};
++    std::uint32_t label_rgba = 0xffffffffU;
++    std::uint32_t value_rgba = 0xffffffffU;
+ };
+ 
+ struct OverlayFrame {
+@@ -38,6 +75,8 @@ struct OverlayFrame {
+     int fps = 0;
+     OverlayConfig config{};
+     Vec2 anchor{};
++    std::size_t row_count = 0;
++    OverlayRow rows[kMaxOverlayRows]{};
+ };
+ 
+ } // namespace common_fps
 --- a/include/common_fps/wire.hpp
 +++ b/include/common_fps/wire.hpp
-@@ -29,7 +29,7 @@
+@@ -16,7 +16,7 @@ namespace common_fps {
+ 
+ inline constexpr std::uint32_t kWireMagic = 0x53465043; // "CFPS"
+ inline constexpr std::uint32_t kWireShutdownMagic = 0x58465043; // "CFPX"
+-inline constexpr std::uint16_t kWireVersion = 1;
++inline constexpr std::uint16_t kWireVersion = 2; // 2: carries the rows to draw
+ inline constexpr std::uint16_t kDefaultIpcPort = 39028;
+ 
+ #pragma pack(push, 1)
+@@ -29,14 +29,21 @@ struct WirePacket {
  
      std::int32_t fps = 0;
      std::uint8_t loading = 1;
@@ -50,9 +213,1004 @@
      std::uint16_t font_size = 24;
  
      float margin_x = 10.0f;
+     float margin_y = 10.0f;
++
++    std::uint8_t row_count = 0;
++    std::uint8_t reserved[3]{};
++    OverlayRow rows[kMaxOverlayRows]{};
+ };
+ #pragma pack(pop)
+ 
++static_assert(sizeof(OverlayRow) == 32);
++static_assert(sizeof(WirePacket) == 36 + 32 * kMaxOverlayRows);
++
+ WirePacket make_wire_packet(
+     const OverlayFrame& frame,
+     std::uint64_t sequence);
+--- a/ps5/CMakeLists.txt
++++ b/ps5/CMakeLists.txt
+@@ -112,8 +112,10 @@ set_target_properties(common_fps_controller PROPERTIES
+ 
+ target_sources(common_fps_controller PRIVATE
+     # Current v1.2.1 sampler, lifecycle and ShellUI implementation.
++    "${ROOT}/src/core/config.cpp"
+     "${ROOT}/src/core/fps_sampler.cpp"
+     "${ROOT}/src/core/layout.cpp"
++    "${ROOT}/src/core/overlay_rows.cpp"
+     "${ROOT}/src/core/wire.cpp"
+     "${ROOT}/src/ps5/commonfps_ps5_main.cpp"
+     "${ROOT}/src/ps5/ps5_platform.cpp"
+--- a/src/core/config.cpp
++++ b/src/core/config.cpp
+@@ -9,34 +9,214 @@
+ #include "common_fps/constants.hpp"
+ 
+ #include <algorithm>
+-#include <cctype>
+-#include <cstdlib>
+-#include <sstream>
+ 
+ namespace common_fps {
+ 
+-static std::string trim(std::string value) {
+-    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front())))
+-        value.erase(value.begin());
+-    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back())))
+-        value.pop_back();
++namespace {
++
++constexpr int kMinFpsThreshold = 1;
++constexpr int kMaxFpsThreshold = 240;
++constexpr float kMaxMargin = 400.0f;
++
++bool is_space(char c) {
++    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
++}
++
++std::string_view trim(std::string_view value) {
++    while (!value.empty() && is_space(value.front()))
++        value.remove_prefix(1);
++    while (!value.empty() && is_space(value.back()))
++        value.remove_suffix(1);
+     return value;
+ }
+ 
+-static Corner parse_corner(const std::string& value) {
+-    if (value == "top_left") return Corner::TopLeft;
+-    if (value == "top_right") return Corner::TopRight;
+-    if (value == "bottom_right") return Corner::BottomRight;
+-    return Corner::BottomLeft;
++char lower(char c) {
++    return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c;
++}
++
++/* Case-insensitive; '-' and ' ' in the input count as '_'. */
++bool same_word(std::string_view input, std::string_view word) {
++    if (input.size() != word.size())
++        return false;
++    for (std::size_t i = 0; i < input.size(); ++i) {
++        char c = lower(input[i]);
++        if (c == '-' || c == ' ')
++            c = '_';
++        if (c != word[i])
++            return false;
++    }
++    return true;
+ }
+ 
++/* Plain decimal such as "24" or "10.5"; anything else is rejected. */
++bool parse_number(std::string_view value, double& out) {
++    if (value.empty() || value.size() > 9)
++        return false;
++
++    double whole = 0.0;
++    double fraction = 0.0;
++    double scale = 1.0;
++    bool digits = false;
++    bool after_point = false;
++
++    for (const char c : value) {
++        if (c == '.' && !after_point) {
++            after_point = true;
++        } else if (c >= '0' && c <= '9') {
++            digits = true;
++            if (after_point) {
++                scale /= 10.0;
++                fraction += (c - '0') * scale;
++            } else {
++                whole = whole * 10.0 + (c - '0');
++            }
++        } else {
++            return false;
++        }
++    }
++
++    if (!digits)
++        return false;
++    out = whole + fraction;
++    return true;
++}
++
++bool parse_switch(std::string_view value, bool& out) {
++    if (same_word(value, "1") || same_word(value, "on") ||
++        same_word(value, "yes") || same_word(value, "true")) {
++        out = true;
++        return true;
++    }
++    if (same_word(value, "0") || same_word(value, "off") ||
++        same_word(value, "no") || same_word(value, "false")) {
++        out = false;
++        return true;
++    }
++    return false;
++}
++
++bool parse_item(std::string_view value, OverlayItem& out) {
++    if (same_word(value, "fps")) {
++        out = OverlayItem::Fps;
++    } else if (same_word(value, "frametime") ||
++               same_word(value, "frame_time") || same_word(value, "ms")) {
++        out = OverlayItem::FrameTime;
++    } else if (same_word(value, "min")) {
++        out = OverlayItem::Min;
++    } else if (same_word(value, "max")) {
++        out = OverlayItem::Max;
++    } else if (same_word(value, "avg") || same_word(value, "average")) {
++        out = OverlayItem::Avg;
++    } else if (same_word(value, "time")) {
++        out = OverlayItem::Time;
++    } else {
++        return false;
++    }
++    return true;
++}
++
++void parse_show(std::string_view value, OverlayConfig& cfg) {
++    OverlayItem items[kMaxOverlayRows]{};
++    std::size_t count = 0;
++
++    while (!value.empty()) {
++        const std::size_t comma = value.find(',');
++        const std::string_view token = trim(value.substr(0, comma));
++        value = comma == std::string_view::npos
++            ? std::string_view{}
++            : value.substr(comma + 1);
++
++        OverlayItem item{};
++        if (!parse_item(token, item) || count == kMaxOverlayRows)
++            continue;
++        if (std::find(items, items + count, item) == items + count)
++            items[count++] = item;
++    }
++
++    /* Nothing usable on the line: keep what was there. */
++    if (count == 0)
++        return;
++    std::copy(items, items + count, cfg.items);
++    cfg.item_count = count;
++}
++
++void apply_setting(
++    std::string_view key,
++    std::string_view value,
++    OverlayConfig& cfg) {
++
++    double number = 0.0;
++
++    if (same_word(key, "corner")) {
++        if (same_word(value, "top_left"))
++            cfg.corner = Corner::TopLeft;
++        else if (same_word(value, "top_right"))
++            cfg.corner = Corner::TopRight;
++        else if (same_word(value, "bottom_left"))
++            cfg.corner = Corner::BottomLeft;
++        else if (same_word(value, "bottom_right"))
++            cfg.corner = Corner::BottomRight;
++    } else if (same_word(key, "show")) {
++        parse_show(value, cfg);
++    } else if (same_word(key, "labels")) {
++        bool on = false;
++        if (same_word(value, "auto"))
++            cfg.labels = LabelMode::Auto;
++        else if (parse_switch(value, on))
++            cfg.labels = on ? LabelMode::On : LabelMode::Off;
++    } else if (same_word(key, "color") || same_word(key, "colour")) {
++        (void)parse_switch(value, cfg.color);
++    } else if (same_word(key, "visible")) {
++        (void)parse_switch(value, cfg.visible);
++    } else if (same_word(key, "font_size")) {
++        if (parse_number(value, number)) {
++            cfg.font_size = std::clamp(
++                static_cast<int>(number), kMinFontSize, kMaxFontSize);
++        }
++    } else if (same_word(key, "margin_x")) {
++        if (parse_number(value, number)) {
++            cfg.margin_x = std::clamp(
++                static_cast<float>(number), 0.0f, kMaxMargin);
++        }
++    } else if (same_word(key, "margin_y")) {
++        if (parse_number(value, number)) {
++            cfg.margin_y = std::clamp(
++                static_cast<float>(number), 0.0f, kMaxMargin);
++        }
++    } else if (same_word(key, "fps_good")) {
++        if (parse_number(value, number)) {
++            cfg.fps_good = std::clamp(
++                static_cast<int>(number), kMinFpsThreshold, kMaxFpsThreshold);
++        }
++    } else if (same_word(key, "fps_ok")) {
++        if (parse_number(value, number)) {
++            cfg.fps_ok = std::clamp(
++                static_cast<int>(number), kMinFpsThreshold, kMaxFpsThreshold);
++        }
++    }
++}
++
++} // namespace
++
+ const char* corner_name(Corner corner) {
+     switch (corner) {
+-        case Corner::TopLeft: return "top_left";
+         case Corner::TopRight: return "top_right";
++        case Corner::BottomLeft: return "bottom_left";
+         case Corner::BottomRight: return "bottom_right";
+-        case Corner::BottomLeft:
+-        default: return "bottom_left";
++        case Corner::TopLeft:
++        default: return "top_left";
++    }
++}
++
++const char* item_name(OverlayItem item) {
++    switch (item) {
++        case OverlayItem::FrameTime: return "frametime";
++        case OverlayItem::Min: return "min";
++        case OverlayItem::Max: return "max";
++        case OverlayItem::Avg: return "avg";
++        case OverlayItem::Time: return "time";
++        case OverlayItem::Fps:
++        default: return "fps";
+     }
+ }
+ 
+@@ -46,44 +226,74 @@ OverlayConfig default_config() {
+ 
+ OverlayConfig parse_config_text(std::string_view text) {
+     OverlayConfig cfg = default_config();
+-    std::istringstream in{std::string(text)};
+-    std::string line;
+ 
+-    while (std::getline(in, line)) {
+-        line = trim(line);
+-        if (line.empty() || line[0] == '#' || line[0] == ';' || line[0] == '[')
++    /* A text editor may leave a UTF-8 byte order mark in front. */
++    if (text.substr(0, 3) == "\xEF\xBB\xBF")
++        text.remove_prefix(3);
++
++    while (!text.empty()) {
++        const std::size_t newline = text.find('\n');
++        std::string_view line = text.substr(0, newline);
++        text = newline == std::string_view::npos
++            ? std::string_view{}
++            : text.substr(newline + 1);
++
++        /* No value contains '#' or ';', so both always start a comment. */
++        line = trim(line.substr(0, line.find_first_of("#;")));
++        if (line.empty() || line.front() == '[')
+             continue;
+ 
+-        const auto pos = line.find('=');
+-        if (pos == std::string::npos)
++        const std::size_t equals = line.find('=');
++        if (equals == std::string_view::npos)
+             continue;
+ 
+-        auto key = trim(line.substr(0, pos));
+-        auto value = trim(line.substr(pos + 1));
+-
+-        if (key == "corner") {
+-            cfg.corner = parse_corner(value);
+-        } else if (key == "font_size") {
+-            const int v = std::atoi(value.c_str());
+-            cfg.font_size = std::clamp(v, kMinFontSize, kMaxFontSize);
+-        } else if (key == "margin_x") {
+-            cfg.margin_x = std::max(0.0f, static_cast<float>(std::atof(value.c_str())));
+-        } else if (key == "margin_y") {
+-            cfg.margin_y = std::max(0.0f, static_cast<float>(std::atof(value.c_str())));
+-        }
++        apply_setting(
++            trim(line.substr(0, equals)),
++            trim(line.substr(equals + 1)),
++            cfg);
+     }
+ 
+     return cfg;
+ }
+ 
+-std::string serialize_config(const OverlayConfig& cfg) {
+-    std::ostringstream out;
+-    out << "[overlay]\n";
+-    out << "corner=" << corner_name(cfg.corner) << "\n";
+-    out << "font_size=" << cfg.font_size << "\n";
+-    out << "margin_x=" << cfg.margin_x << "\n";
+-    out << "margin_y=" << cfg.margin_y << "\n";
+-    return out.str();
++const char* default_config_text() {
++    return
++        "# SimpleFPS settings\n"
++        "# Change a value and save. The overlay follows within a few seconds.\n"
++        "# Delete this file to get the defaults back.\n"
++        "\n"
++        "# Corner: top_left, top_right, bottom_left, bottom_right\n"
++        "corner=top_left\n"
++        "\n"
++        "# What to show, top to bottom, separated by commas:\n"
++        "#   fps        frames per second\n"
++        "#   frametime  milliseconds per frame\n"
++        "#   min        lowest fps since the game started\n"
++        "#   max        highest fps since the game started\n"
++        "#   avg        average fps since the game started\n"
++        "#   time       time since the game started\n"
++        "# Example: show=fps,frametime,min,max,avg,time\n"
++        "show=fps\n"
++        "\n"
++        "# Names in front of the values: auto, on, off\n"
++        "# auto = on the extra lines only, the fps number stays bare\n"
++        "labels=auto\n"
++        "\n"
++        "# color=1 paints the fps number: green from fps_good up,\n"
++        "# yellow from fps_ok up, red below. color=0 keeps it white.\n"
++        "color=0\n"
++        "fps_good=55\n"
++        "fps_ok=30\n"
++        "\n"
++        "# Text size, 18 to 36\n"
++        "font_size=24\n"
++        "\n"
++        "# Distance from the screen edges\n"
++        "margin_x=10\n"
++        "margin_y=10\n"
++        "\n"
++        "# visible=0 hides the overlay, visible=1 shows it\n"
++        "visible=1\n";
+ }
+ 
+ } // namespace common_fps
+--- a/src/core/layout.cpp
++++ b/src/core/layout.cpp
+@@ -8,8 +8,101 @@
+ #include "common_fps/layout.hpp"
+ #include "common_fps/constants.hpp"
+ 
++#include <algorithm>
++
+ namespace common_fps {
+ 
++namespace {
++
++/* Same single-line box as compute_anchor, and the step between two rows. */
++constexpr float kRowBoxHeight = 1.45f;
++constexpr float kRowStep = 1.30f;
++constexpr float kLabelGap = 0.50f;
++/* The value column never gets narrower than three digits, so names stay put. */
++constexpr float kMinValueColumn = 1.80f;
++
++bool is_right_corner(Corner corner) {
++    return corner == Corner::TopRight || corner == Corner::BottomRight;
++}
++
++bool is_bottom_corner(Corner corner) {
++    return corner == Corner::BottomLeft || corner == Corner::BottomRight;
++}
++
++} // namespace
++
++float estimate_text_width(const char* text, int font_size) {
++    /* The font is proportional and cannot be measured here: per-glyph guesses. */
++    float units = 0.0f;
++    for (; text && *text; ++text) {
++        const char c = *text;
++        if (c >= '0' && c <= '9')
++            units += 0.60f;
++        else if (c >= 'A' && c <= 'Z')
++            units += 0.70f;
++        else if (c == '.' || c == ':' || c == ' ')
++            units += 0.30f;
++        else if (c == '-')
++            units += 0.40f;
++        else
++            units += 0.60f;
++    }
++    return units * static_cast<float>(font_size);
++}
++
++void compute_row_positions(const OverlayFrame& frame, RowPosition* out) {
++    const OverlayConfig& cfg = frame.config;
++    const float font = static_cast<float>(cfg.font_size);
++    const std::size_t count = std::min(frame.row_count, kMaxOverlayRows);
++
++    float label_width = 0.0f;
++    float value_width = 0.0f;
++    for (std::size_t i = 0; i < count; ++i) {
++        label_width = std::max(
++            label_width,
++            estimate_text_width(frame.rows[i].label, cfg.font_size));
++        value_width = std::max(
++            value_width,
++            estimate_text_width(frame.rows[i].value, cfg.font_size));
++    }
++
++    const bool named = label_width > 0.0f;
++    const bool right = is_right_corner(cfg.corner);
++    if (named)
++        value_width = std::max(value_width, font * kMinValueColumn);
++
++    const float label_column = named ? label_width + font * kLabelGap : 0.0f;
++    const float left = right
++        ? kLogicalWidth - cfg.margin_x - label_column - value_width
++        : cfg.margin_x;
++    const float value_edge = left + label_column + value_width;
++
++    const float step = font * kRowStep;
++    const float rows_above =
++        count > 0 ? static_cast<float>(count - 1) : 0.0f;
++    const float top = is_bottom_corner(cfg.corner)
++        ? kLogicalHeight - cfg.margin_y - font * kRowBoxHeight -
++              rows_above * step
++        : cfg.margin_y;
++
++    for (std::size_t i = 0; i < kMaxOverlayRows; ++i) {
++        RowPosition& row = out[i];
++        row.label_x = left;
++        row.y = top + static_cast<float>(i) * step;
++        row.value_x = left + label_column;
++        if (i >= count)
++            continue;
++
++        if (named && frame.rows[i].label[0] == '\0') {
++            /* The bare fps number lines up with the names below it. */
++            row.value_x = left;
++        } else if (named || right) {
++            row.value_x = value_edge - estimate_text_width(
++                frame.rows[i].value, cfg.font_size);
++        }
++    }
++}
++
+ Vec2 compute_anchor(const OverlayConfig& cfg) {
+     // Approximate single-line logical bounding box.
+     const float width = static_cast<float>(cfg.font_size) * 5.2f;
+--- /dev/null
++++ b/src/core/overlay_rows.cpp
+@@ -0,0 +1,142 @@
++/*
++ * SimpleFPS addition to Common FPS for PS5
++ *
++ * SPDX-License-Identifier: GPL-3.0-or-later
++ */
++
++#include "common_fps/overlay_rows.hpp"
++
++#include <algorithm>
++#include <cstdio>
++
++namespace common_fps {
++
++namespace {
++
++constexpr std::uint32_t kWhite = 0xffffffffU;
++constexpr std::uint32_t kValueOrange = 0xffa726ffU;
++constexpr std::uint32_t kGood = 0x4cd964ffU;
++constexpr std::uint32_t kOk = 0xffd60affU;
++constexpr std::uint32_t kBad = 0xff453affU;
++
++constexpr std::uint32_t kFpsName = 0xb366ffffU; // the "FPS:" purple of Common FPS
++constexpr std::uint32_t kFrameTimeName = 0x33b5ffffU;
++constexpr std::uint32_t kStatsName = 0x4cd964ffU;
++constexpr std::uint32_t kTimeName = 0xff7eb6ffU;
++
++struct ItemStyle {
++    const char* name;
++    std::uint32_t name_rgba;
++    std::uint32_t value_rgba;
++};
++
++ItemStyle style_of(OverlayItem item) {
++    switch (item) {
++        case OverlayItem::FrameTime: return {"MS", kFrameTimeName, kValueOrange};
++        case OverlayItem::Min: return {"MIN", kStatsName, kValueOrange};
++        case OverlayItem::Max: return {"MAX", kStatsName, kValueOrange};
++        case OverlayItem::Avg: return {"AVG", kStatsName, kValueOrange};
++        case OverlayItem::Time: return {"TIME", kTimeName, kValueOrange};
++        case OverlayItem::Fps:
++        default: return {"FPS", kFpsName, kWhite};
++    }
++}
++
++void write_number(char* out, bool known, int number) {
++    if (known)
++        std::snprintf(out, kOverlayValueSize, "%d", number);
++    else
++        std::snprintf(out, kOverlayValueSize, "--");
++}
++
++/* Milliseconds per frame with one decimal, in integers: 60 -> "16.7". */
++void write_frame_time(char* out, bool known, int fps) {
++    if (!known || fps <= 0) {
++        std::snprintf(out, kOverlayValueSize, "--");
++        return;
++    }
++    const int tenths = std::min((10000 + fps / 2) / fps, 9999);
++    std::snprintf(out, kOverlayValueSize, "%d.%d", tenths / 10, tenths % 10);
++}
++
++void write_duration(char* out, std::uint64_t seconds) {
++    const unsigned long long hours = seconds / 3600U;
++    const unsigned minutes = static_cast<unsigned>(seconds / 60U % 60U);
++    const unsigned rest = static_cast<unsigned>(seconds % 60U);
++    if (hours > 0) {
++        std::snprintf(
++            out, kOverlayValueSize, "%llu:%02u:%02u",
++            std::min(hours, 999ULL), minutes, rest);
++    } else {
++        std::snprintf(out, kOverlayValueSize, "%u:%02u", minutes, rest);
++    }
++}
++
++} // namespace
++
++void FpsStats::add(int fps) noexcept {
++    /* A stalled second (loading screen, suspended game) is not a frame rate. */
++    if (fps <= 0)
++        return;
++    min_ = count_ == 0 ? fps : std::min(min_, fps);
++    max_ = count_ == 0 ? fps : std::max(max_, fps);
++    sum_ += static_cast<std::uint64_t>(fps);
++    ++count_;
++}
++
++int FpsStats::average() const noexcept {
++    return count_ == 0
++        ? 0
++        : static_cast<int>((sum_ + count_ / 2) / count_);
++}
++
++void build_overlay_rows(OverlayFrame& frame, const OverlayReadings& readings) {
++    const OverlayConfig& cfg = frame.config;
++    const std::size_t count =
++        cfg.visible ? std::min(cfg.item_count, kMaxOverlayRows) : 0;
++    /* auto: names tell several lines apart, and the fps number needs none. */
++    const bool all_named = cfg.labels == LabelMode::On;
++    const bool others_named = cfg.labels == LabelMode::Auto && count > 1;
++    const bool have_stats = !readings.stats.empty();
++
++    frame.row_count = count;
++    for (std::size_t i = 0; i < count; ++i) {
++        const OverlayItem item = cfg.items[i];
++        const ItemStyle style = style_of(item);
++        OverlayRow& row = frame.rows[i];
++        row = OverlayRow{};
++        row.label_rgba = style.name_rgba;
++        row.value_rgba = style.value_rgba;
++        if (all_named || (others_named && item != OverlayItem::Fps))
++            std::snprintf(row.label, kOverlayLabelSize, "%s", style.name);
++
++        switch (item) {
++            case OverlayItem::Fps:
++                write_number(row.value, readings.have_fps, readings.fps);
++                if (cfg.color && readings.have_fps) {
++                    row.value_rgba =
++                        readings.fps >= cfg.fps_good ? kGood
++                        : readings.fps >= cfg.fps_ok ? kOk
++                        : kBad;
++                }
++                break;
++            case OverlayItem::FrameTime:
++                write_frame_time(row.value, readings.have_fps, readings.fps);
++                break;
++            case OverlayItem::Min:
++                write_number(row.value, have_stats, readings.stats.min());
++                break;
++            case OverlayItem::Max:
++                write_number(row.value, have_stats, readings.stats.max());
++                break;
++            case OverlayItem::Avg:
++                write_number(row.value, have_stats, readings.stats.average());
++                break;
++            case OverlayItem::Time:
++                write_duration(row.value, readings.session_seconds);
++                break;
++        }
++    }
++}
++
++} // namespace common_fps
+--- a/src/core/wire.cpp
++++ b/src/core/wire.cpp
+@@ -46,6 +46,13 @@ WirePacket make_wire_packet(
+         std::clamp(frame.config.font_size, kMinFontSize, kMaxFontSize));
+     packet.margin_x = frame.config.margin_x;
+     packet.margin_y = frame.config.margin_y;
++
++    const std::size_t rows = frame.visible
++        ? std::min(frame.row_count, kMaxOverlayRows)
++        : 0;
++    packet.row_count = static_cast<std::uint8_t>(rows);
++    for (std::size_t i = 0; i < rows; ++i)
++        packet.rows[i] = frame.rows[i];
+     return packet;
+ }
+ 
+@@ -83,6 +90,14 @@ decode_wire_packet(const WirePacket& packet) {
+     frame.config.margin_x = std::max(0.0f, packet.margin_x);
+     frame.config.margin_y = std::max(0.0f, packet.margin_y);
+     frame.anchor = compute_anchor(frame.config);
++
++    frame.row_count = std::min<std::size_t>(packet.row_count, kMaxOverlayRows);
++    for (std::size_t i = 0; i < frame.row_count; ++i) {
++        frame.rows[i] = packet.rows[i];
++        /* The text is handed to Mono as a C string: never trust the sender. */
++        frame.rows[i].label[kOverlayLabelSize - 1] = '\0';
++        frame.rows[i].value[kOverlayValueSize - 1] = '\0';
++    }
+     return frame;
+ }
+ 
+--- a/src/ps5/commonfps_ps5_main.cpp
++++ b/src/ps5/commonfps_ps5_main.cpp
+@@ -5,8 +5,10 @@
+  * SPDX-License-Identifier: GPL-3.0-or-later
+  */
+ 
++#include "common_fps/config.hpp"
+ #include "common_fps/fps_sampler.hpp"
+ #include "common_fps/layout.hpp"
++#include "common_fps/overlay_rows.hpp"
+ #include "common_fps/wire.hpp"
+ #include "ps5_platform.hpp"
+ #include "dce_fps_sampler.hpp"
+@@ -21,6 +23,7 @@
+ #include <cstring>
+ #include <fcntl.h>
+ #include <optional>
++#include <string_view>
+ #include <sys/types.h>
+ #include <unistd.h>
+ 
+@@ -29,6 +32,17 @@ namespace {
+ constexpr const char* kControllerLog =
+     "/data/CommonFPS_v1_2_1.log";
+ 
++/* SimpleFPS settings, read once a second so an edit shows while playing. */
++constexpr const char* kSettingsPath = "/data/simplefps.ini";
++constexpr std::size_t kSettingsMaxSize = 4096;
++
++/*
++ * The newest launch owns the overlay. Each controller writes its pid here when
++ * it starts; one that later reads another pid stops for good. Without this a
++ * second launch leaves two controllers sending the renderer different numbers.
++ */
++constexpr const char* kOwnerPath = "/system_tmp/simplefps_owner.pid";
++
+ constexpr std::uint64_t kDceVideoOutStandbyUs = 60'000'000ULL;
+ constexpr unsigned kDceMissesBeforeVideoOutWake = 3;
+ 
+@@ -303,9 +317,236 @@ void append_first_fps_record(
+     (void)close(fd);
+ }
+ 
++void append_settings_record(
++    const char* source,
++    const common_fps::OverlayConfig& cfg) noexcept {
++
++    const int fd = open(
++        kControllerLog,
++        O_WRONLY | O_CREAT | O_APPEND | O_SYNC,
++        0644);
++    if (fd < 0)
++        return;
++
++    char show[96]{};
++    std::size_t used = 0;
++    for (std::size_t i = 0;
++         i < cfg.item_count && used < sizeof(show);
++         ++i) {
++        const int n = std::snprintf(
++            show + used,
++            sizeof(show) - used,
++            "%s%s",
++            i == 0 ? "" : ",",
++            common_fps::item_name(cfg.items[i]));
++        if (n <= 0)
++            break;
++        used += static_cast<std::size_t>(n);
++    }
++
++    char record[320]{};
++    const int record_size = std::snprintf(
++        record,
++        sizeof(record),
++        "Settings source=%s path=%s corner=%s show=%s labels=%d color=%d "
++        "fps_good=%d fps_ok=%d font_size=%d margin_x=%d margin_y=%d "
++        "visible=%d\n",
++        source,
++        kSettingsPath,
++        common_fps::corner_name(cfg.corner),
++        show,
++        static_cast<int>(cfg.labels),
++        cfg.color ? 1 : 0,
++        cfg.fps_good,
++        cfg.fps_ok,
++        cfg.font_size,
++        static_cast<int>(cfg.margin_x),
++        static_cast<int>(cfg.margin_y),
++        cfg.visible ? 1 : 0);
++
++    if (record_size > 0) {
++        const std::size_t safe_size =
++            static_cast<std::size_t>(record_size) < sizeof(record)
++                ? static_cast<std::size_t>(record_size)
++                : sizeof(record) - 1;
++        write_all(fd, record, safe_size);
++    }
++
++    (void)fsync(fd);
++    (void)close(fd);
++}
++
++/*
++ * The settings file as last seen. It is small, so it is read whole every
++ * second and compared: that needs no file times, and catches an editor that
++ * saves by writing a new file and renaming it over the old one.
++ */
++struct SettingsFile {
++    char text[kSettingsMaxSize]{};
++    std::size_t size = 0;
++    bool loaded = false;
++    bool defaults_logged = false;
++    bool create_failed = false;
++};
++
++enum class SettingsRead {
++    Ok,
++    Missing,
++    Failed,
++};
++
++SettingsRead read_settings_file(char* out, std::size_t& size) noexcept {
++    const int fd = open(kSettingsPath, O_RDONLY);
++    if (fd < 0)
++        return errno == ENOENT ? SettingsRead::Missing : SettingsRead::Failed;
++
++    size = 0;
++    bool ok = true;
++    while (size < kSettingsMaxSize) {
++        const ssize_t n = read(fd, out + size, kSettingsMaxSize - size);
++        if (n > 0) {
++            size += static_cast<std::size_t>(n);
++            continue;
++        }
++        if (n < 0 && errno == EINTR)
++            continue;
++        ok = n == 0;
++        break;
++    }
++
++    (void)close(fd);
++    return ok ? SettingsRead::Ok : SettingsRead::Failed;
++}
++
++/* Never replaces a file that is there: O_EXCL fails instead. */
++bool write_default_settings_file() noexcept {
++    const int fd = open(
++        kSettingsPath,
++        O_WRONLY | O_CREAT | O_EXCL,
++        0666);
++    if (fd < 0)
++        return false;
++
++    const char* text = common_fps::default_config_text();
++    write_all(fd, text, std::strlen(text));
++    (void)fsync(fd);
++    (void)close(fd);
++    return true;
++}
++
++void refresh_settings(
++    SettingsFile& file,
++    common_fps::OverlayConfig& cfg) noexcept {
++
++    char text[kSettingsMaxSize];
++    std::size_t size = 0;
++    const SettingsRead result = read_settings_file(text, size);
++
++    if (result == SettingsRead::Failed) {
++        /* A read that failed half way says nothing: keep the settings in use. */
++        return;
++    }
++
++    if (result == SettingsRead::Missing) {
++        if (!file.create_failed)
++            file.create_failed = !write_default_settings_file();
++        if (file.loaded || !file.defaults_logged) {
++            cfg = common_fps::default_config();
++            append_settings_record("defaults", cfg);
++        }
++        file.loaded = false;
++        file.defaults_logged = true;
++        return;
++    }
++
++    /* Compared by hand: the controller imports nothing Common FPS did not. */
++    bool unchanged = file.loaded && size == file.size;
++    for (std::size_t i = 0; unchanged && i < size; ++i)
++        unchanged = text[i] == file.text[i];
++    if (unchanged)
++        return;
++
++    std::memcpy(file.text, text, size);
++    file.size = size;
++    file.loaded = true;
++    cfg = common_fps::parse_config_text(std::string_view(text, size));
++    append_settings_record("file", cfg);
++}
++
++void claim_overlay() noexcept {
++    const int fd = open(
++        kOwnerPath,
++        O_WRONLY | O_CREAT | O_TRUNC,
++        0644);
++    if (fd < 0)
++        return;
++
++    char text[16]{};
++    const int size = std::snprintf(text, sizeof(text), "%d\n", getpid());
++    if (size > 0 && static_cast<std::size_t>(size) < sizeof(text))
++        write_all(fd, text, static_cast<std::size_t>(size));
++    (void)fsync(fd);
++    (void)close(fd);
++}
++
++/*
++ * True once a later launch has written its pid. A file that is missing,
++ * unreadable or half written (no line end yet) changes nothing.
++ */
++bool overlay_taken_over() noexcept {
++    const int fd = open(kOwnerPath, O_RDONLY);
++    if (fd < 0)
++        return false;
++
++    char text[16]{};
++    const ssize_t size = read(fd, text, sizeof(text) - 1);
++    (void)close(fd);
++    if (size <= 0)
++        return false;
++
++    long owner = 0;
++    ssize_t digits = 0;
++    while (digits < size && text[digits] >= '0' && text[digits] <= '9') {
++        owner = owner * 10 + (text[digits] - '0');
++        ++digits;
++    }
++    if (digits == 0 || digits == size || text[digits] != '\n')
++        return false;
++    return owner != static_cast<long>(getpid());
++}
++
++void append_yield_record() noexcept {
++    const int fd = open(
++        kControllerLog,
++        O_WRONLY | O_CREAT | O_APPEND | O_SYNC,
++        0644);
++    if (fd < 0)
++        return;
++
++    char record[160]{};
++    const int record_size = std::snprintf(
++        record,
++        sizeof(record),
++        "Controller pid=%d stopped: a newer launch owns the overlay "
++        "sends=stopped injection=stopped process=resident\n",
++        getpid());
++
++    if (record_size > 0) {
++        const std::size_t safe_size =
++            static_cast<std::size_t>(record_size) < sizeof(record)
++                ? static_cast<std::size_t>(record_size)
++                : sizeof(record) - 1;
++        write_all(fd, record, safe_size);
++    }
++
++    (void)fsync(fd);
++    (void)close(fd);
++}
++
+ [[noreturn]] void run_tracked_worker() noexcept {
+     const ShellUiObservation first = observe_shellui_once();
+     write_worker_ready_record(first);
++    claim_overlay();
+ 
+     common_fps::ps5::Ps5Platform platform;
+     common_fps::FpsSampler sampler(platform);
+@@ -325,7 +566,10 @@ void append_first_fps_record(
+     bool have_fps = false;
+     int latest_fps = 0;
+     std::uint64_t sequence = 1;
+-    const common_fps::OverlayConfig overlay_config{};
++    common_fps::OverlayConfig overlay_config{};
++    SettingsFile settings_file;
++    common_fps::FpsStats session_stats;
++    std::uint64_t session_start_us = 0;
+ 
+     /*
+      * The controller remains in etaHEN's tracked process: no second fork,
+@@ -334,6 +578,18 @@ void append_first_fps_record(
+      * injection.  A changed PID after rest mode restarts the same gate.
+      */
+     for (;;) {
++        if (overlay_taken_over()) {
++            /*
++             * Like the rest of the controller, no exit path: stay resident,
++             * but never sample, send or touch the home screen again.
++             */
++            append_yield_record();
++            for (;;)
++                platform.sleep_ms(60000);
++        }
++
++        refresh_settings(settings_file, overlay_config);
++
+         const ShellUiObservation shellui = observe_shellui_once();
+         if (shellui.pid > 0) {
+             if (shellui.pid == stable_shellui_pid) {
+@@ -367,6 +623,8 @@ void append_first_fps_record(
+             } else {
+                 stable_game_pid = *observed_game_pid;
+                 stable_game_observations = 1;
++                session_stats.reset();
++                session_start_us = platform.monotonic_us();
+ 
+                 sampler.reset();
+                 reported_pid = -1;
+@@ -381,6 +639,8 @@ void append_first_fps_record(
+         } else {
+             stable_game_pid = -1;
+             stable_game_observations = 0;
++            session_stats.reset();
++            session_start_us = 0;
+ 
+             sampler.reset();
+             reported_pid = -1;
+@@ -504,6 +764,9 @@ void append_first_fps_record(
+                 common_fps::ps5::ensure_shellui_renderer();
+         }
+ 
++        if (have_fps)
++            session_stats.add(latest_fps);
++
+         if (renderer_online) {
+             common_fps::OverlayFrame frame{};
+             frame.visible = true;
+@@ -511,6 +774,16 @@ void append_first_fps_record(
+             frame.fps = latest_fps;
+             frame.config = overlay_config;
+             frame.anchor = common_fps::compute_anchor(frame.config);
++
++            common_fps::OverlayReadings readings{};
++            readings.have_fps = have_fps;
++            readings.fps = latest_fps;
++            readings.stats = session_stats;
++            readings.session_seconds = session_start_us != 0
++                ? (platform.monotonic_us() - session_start_us) / 1'000'000ULL
++                : 0;
++            common_fps::build_overlay_rows(frame, readings);
++
+             (void)sender.send(common_fps::make_wire_packet(frame, sequence++));
+         }
+ 
 --- a/src/ps5/shellui_hook_controller.cpp
 +++ b/src/ps5/shellui_hook_controller.cpp
-@@ -153,9 +153,11 @@
+@@ -153,9 +153,11 @@ ShellUiHookPollResult poll_and_apply_shellui_hook(
  
      const std::uint32_t firmware_family =
          report.sdk_version & 0xffff0000U;
@@ -65,7 +1223,7 @@
          backend == ShellUiHookBackend::Mdbg;
  
      report.backend = fw900_guard_write
-@@ -186,6 +188,9 @@
+@@ -186,6 +188,9 @@ ShellUiHookPollResult poll_and_apply_shellui_hook(
              static_cast<intptr_t>(request.method_address + offset);
  
          if (fw900_guard_write) {
@@ -77,40 +1235,294 @@
              if (kernel_mprotect(
 --- a/src/ps5/shellui_payload/commonfps_shellui.cpp
 +++ b/src/ps5/shellui_payload/commonfps_shellui.cpp
-@@ -975,15 +975,15 @@
+@@ -14,6 +14,7 @@
+  */
  
-         const float x = frame.anchor.x;
-         const float y = frame.anchor.y;
+ #include "commonfps_shellui.hpp"
++#include "common_fps/layout.hpp"
+ #include "common_fps/shellui_hook_protocol.hpp"
+ 
+ #include <arpa/inet.h>
+@@ -126,8 +127,24 @@ mono_gchandle_free_t mono_gchandle_free_ = mono_gchandle_free;
+ MonoDomain* g_domain{};
+ MonoImage* g_pui_image{};
+ std::uint32_t g_game_scene_handle{};
+-std::uint32_t g_label_handle{};
+-std::uint32_t g_value_handle{};
++
++/*
++ * One text widget and what was last written to it, so that a packet only
++ * touches the properties that changed. "known" is false for a widget found
++ * by name, whose properties were written by someone else.
++ */
++struct TextWidget {
++    std::uint32_t handle{};
++    bool known = false;
++    char text[kOverlayValueSize]{};
++    float x{};
++    float y{};
++    std::uint32_t rgba{};
++    int font_size{};
++};
++
++TextWidget g_label_widgets[kMaxOverlayRows]{};
++TextWidget g_value_widgets[kMaxOverlayRows]{};
+ MonoMethod* g_find_scene_method{};
+ bool g_background_render_mode = false;
+ 
+@@ -739,8 +756,10 @@ bool refresh_game_scene() {
+         return false;
+ 
+     if (managed_target(g_game_scene_handle) != game_scene) {
+-        release_managed_handle(g_label_handle);
+-        release_managed_handle(g_value_handle);
++        for (std::size_t i = 0; i < kMaxOverlayRows; ++i) {
++            release_managed_handle(g_label_widgets[i].handle);
++            release_managed_handle(g_value_widgets[i].handle);
++        }
+         if (!replace_managed_handle(g_game_scene_handle, game_scene))
+             return false;
+         log_line(
+@@ -938,6 +957,120 @@ bool set_label_text(MonoObject* label, const char* text) {
+     return set_property_direct(klass, label, "Text", mono_text);
+ }
+ 
++/* Row 0 keeps the widget names of Common FPS; later rows add their number. */
++void widget_name(char* out, std::size_t size, const char* base, std::size_t row) {
++    if (row == 0)
++        std::snprintf(out, size, "%s", base);
++    else
++        std::snprintf(out, size, "%s_%u", base, static_cast<unsigned>(row));
++}
++
++/*
++ * Brings one widget in line with the wanted text, place, colour and size.
++ * A widget is created the first time it has text to show; hiding it later
++ * only empties its text, with the same setter Common FPS uses every second.
++ */
++bool apply_text_widget(
++    MonoObject* root,
++    TextWidget& state,
++    const char* name,
++    const char* text,
++    float x,
++    float y,
++    std::uint32_t rgba,
++    int font_size,
++    int horizontal_alignment,
++    MonoObject*& font) {
++
++    MonoObject* widget = managed_target(state.handle);
++    if (!widget) {
++        state.known = false;
++        if (text[0] == '\0')
++            return true;
++        widget = find_widget(root, name);
++    } else if (text[0] == '\0' && state.known) {
++        /* Hidden: empty the text and leave place, colour and size alone. */
++        if (state.text[0] != '\0') {
++            if (!set_label_text(widget, text))
++                return false;
++            state.text[0] = '\0';
++        }
++        return true;
++    }
++
++    const float r = static_cast<float>((rgba >> 24) & 0xffU) / 255.0f;
++    const float g = static_cast<float>((rgba >> 16) & 0xffU) / 255.0f;
++    const float b = static_cast<float>((rgba >> 8) & 0xffU) / 255.0f;
++    const float a = static_cast<float>(rgba & 0xffU) / 255.0f;
++
++    const bool need_font = !widget || !state.known ||
++        state.font_size != font_size;
++    if (need_font && !font) {
++        font = create_font(font_size);
++        if (!font) {
++            log_line("UIFont create failed");
++            return false;
++        }
++    }
++
++    if (!widget) {
++        widget = create_label(
++            name, x, y, text, font, horizontal_alignment, r, g, b, a);
++        if (widget && !append_child(root, widget))
++            widget = nullptr;
++
++        log_line(
++            "widget create name=%s widget=%p font=%d x=%.1f y=%.1f",
++            name,
++            static_cast<void*>(widget),
++            font_size,
++            x,
++            y);
++        if (!widget)
++            return false;
++    } else {
++        MonoClass* klass = mono_class_from_name_(
++            g_pui_image,
++            "Sce.PlayStation.PUI.UI2",
++            "Label");
++        if (!klass)
++            return false;
++
++        bool ok = true;
++        if (need_font)
++            ok &= set_property_object(klass, widget, "Font", font);
++        if (!state.known || state.rgba != rgba) {
++            MonoObject* color = create_color(r, g, b, a);
++            ok &= color && set_property_object(
++                klass, widget, "TextColor", color);
++        }
++        if (!state.known || state.x != x)
++            ok &= set_property_direct(klass, widget, "X", x);
++        if (!state.known || state.y != y)
++            ok &= set_property_direct(klass, widget, "Y", y);
++        if (!state.known || std::strcmp(state.text, text) != 0)
++            ok &= set_label_text(widget, text);
++        if (!ok) {
++            state.known = false;
++            return false;
++        }
++    }
++
++    if (!replace_managed_handle(state.handle, widget)) {
++        log_line("widget GC handle failed name=%s handle=%u", name, state.handle);
++        state.known = false;
++        return false;
++    }
++
++    state.known = true;
++    std::snprintf(state.text, sizeof(state.text), "%s", text);
++    state.x = x;
++    state.y = y;
++    state.rgba = rgba;
++    state.font_size = font_size;
++    return true;
++}
++
+ bool apply_packet_on_render(const WirePacket& packet) {
+     const auto decoded = decode_wire_packet(packet);
+     if (!decoded)
+@@ -958,86 +1091,46 @@ bool apply_packet_on_render(const WirePacket& packet) {
+         return false;
+     }
+ 
+-    MonoObject* label = managed_target(g_label_handle);
+-    MonoObject* value = managed_target(g_value_handle);
+-
+-    if (!label)
+-        label = find_widget(root, kLabelId);
+-    if (!value)
+-        value = find_widget(root, kValueId);
+-
+-    if (!label || !value) {
+-        MonoObject* font = create_font(frame.config.font_size);
+-        if (!font) {
+-            log_line("UIFont create failed");
+-            return false;
+-        }
+-
+-        const float x = frame.anchor.x;
+-        const float y = frame.anchor.y;
 -        const float value_x =
 -            x + static_cast<float>(frame.config.font_size) * 2.7f;
-+        /* The number alone, in the corner: the "FPS:" label stays, empty. */
-+        const float value_x = x;
- 
-         if (!label) {
-             label = create_label(
-                 kLabelId,
-                 x,
-                 y,
+-
+-        if (!label) {
+-            label = create_label(
+-                kLabelId,
+-                x,
+-                y,
 -                "FPS:",
-+                "",
-                 font,
-                 1,
-                 0.702f,
-@@ -999,7 +999,7 @@
-                 kValueId,
-                 value_x,
-                 y,
--                "Loading",
-+                "--",
-                 font,
-                 0,
-                 1.0f,
-@@ -1034,7 +1034,7 @@
+-                font,
+-                1,
+-                0.702f,
+-                0.400f,
+-                1.000f,
+-                1.000f);
+-            if (label && !append_child(root, label))
+-                label = nullptr;
+-        }
++    RowPosition positions[kMaxOverlayRows]{};
++    compute_row_positions(frame, positions);
  
-     char text[32]{};
-     if (frame.loading)
+-        if (!value) {
+-            value = create_label(
+-                kValueId,
+-                value_x,
+-                y,
+-                "Loading",
+-                font,
+-                0,
+-                1.0f,
+-                1.0f,
+-                1.0f,
+-                1.0f);
+-            if (value && !append_child(root, value))
+-                value = nullptr;
+-        }
++    /* Made on demand: most packets change text only and need no font. */
++    MonoObject* font = nullptr;
++    bool ok = true;
+ 
+-        log_line(
+-            "widgets create seq=%llu label=%p value=%p font=%d x=%.1f y=%.1f",
+-            static_cast<unsigned long long>(packet.sequence),
+-            static_cast<void*>(label),
+-            static_cast<void*>(value),
++    for (std::size_t i = 0; i < kMaxOverlayRows; ++i) {
++        const bool shown = i < frame.row_count;
++        const OverlayRow& row = frame.rows[i];
++        char name[40]{};
++
++        widget_name(name, sizeof(name), kLabelId, i);
++        ok &= apply_text_widget(
++            root,
++            g_label_widgets[i],
++            name,
++            shown ? row.label : "",
++            positions[i].label_x,
++            positions[i].y,
++            row.label_rgba,
+             frame.config.font_size,
+-            x,
+-            y);
+-    }
+-
+-    if (!label || !value)
+-        return false;
+-
+-    if (!replace_managed_handle(g_label_handle, label) ||
+-        !replace_managed_handle(g_value_handle, value)) {
+-        log_line(
+-            "widget GC handle failed label=%u value=%u",
+-            g_label_handle,
+-            g_value_handle);
+-        return false;
++            1,
++            font);
++
++        widget_name(name, sizeof(name), kValueId, i);
++        ok &= apply_text_widget(
++            root,
++            g_value_widgets[i],
++            name,
++            shown ? row.value : "",
++            positions[i].value_x,
++            positions[i].y,
++            row.value_rgba,
++            frame.config.font_size,
++            0,
++            font);
+     }
+ 
+-    char text[32]{};
+-    if (frame.loading)
 -        std::snprintf(text, sizeof(text), "Loading");
-+        std::snprintf(text, sizeof(text), "--");
-     else
-         std::snprintf(text, sizeof(text), "%d", frame.fps);
-     return set_label_text(value, text);
+-    else
+-        std::snprintf(text, sizeof(text), "%d", frame.fps);
+-    return set_label_text(value, text);
++    return ok;
+ }
+ 
+ void apply_latest_state_on_render() {

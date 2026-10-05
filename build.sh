@@ -23,6 +23,8 @@ mkdir -p "$work"
 fetch src https://github.com/porhe911/Common-FPS-for-PS5.git b7969fd
 fetch etahen https://github.com/etaHEN/etaHEN.git d47f99bd37f349ae59b3c4b66e09e93ba69f56cd
 fetch shsrv https://github.com/ps5-payload-dev/shsrv.git 6f320637d56d344a0e7797753099e33238bbf146
+# The checkout above resets the files the patch changes, not the ones it adds.
+git -C "$work/src" clean -q -fd
 git -C "$work/src" apply "$here/simplefps.patch"
 
 "$PS5_PAYLOAD_SDK/bin/prospero-cmake" -S "$work/src/ps5" -B "$work/build" -DCMAKE_BUILD_TYPE=Release \
