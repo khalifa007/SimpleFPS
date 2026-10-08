@@ -3,7 +3,8 @@
 
 The frame rate of the running game, as a plain number in the top left corner of the screen, on a
 jailbroken PS5 with system software 13.60. A settings file on the console moves it to another corner
-and adds more lines: frame time, lowest, highest and average frame rate, and play time.
+and adds more lines: frame time, lowest, highest and average frame rate, and play time. For OLED
+screens it can also dim the text and move it from corner to corner on a timer.
 
 SimpleFPS is [Common FPS for PS5](https://github.com/porhe911/Common-FPS-for-PS5) v1.2.1 by porhe911
 with a patch. Common FPS stops at system software 10.xx; the patch lets it run on 11.xx to 13.xx,
@@ -24,6 +25,7 @@ loaded through the ELF loader on port 9021.
 - With the default settings the overlay asks the home screen for the same things as the first release:
   one text, updated once a second.
 - 11.xx, 12.xx and 13.00 to 13.50 are allowed by the patch but have not been tried by anyone.
+- v1.2 adds `opacity` and `rotate`. The build is checked, but neither has been seen on screen yet.
 
 Use it at your own risk.
 
@@ -54,6 +56,8 @@ Things to know:
   a second launch should be harmless, because the newer copy takes the overlay over and the older one
   goes quiet, but that has not been tried on a console yet.
 - A new build needs a restart of the console first, because the drawing part stays in the home screen.
+  Coming from v1.1 that should not be necessary: v1.2 changes the controller only, and the packets the
+  drawing part receives are the same. This has not been tried.
 - It writes a log to `/data/CommonFPS_v1_2_1.log`. Each time it reads the settings, it notes there what
   it understood.
 
@@ -74,6 +78,8 @@ that runs in a sandbox has its own `/data` and does not see the file.
 | `font_size` | `18` to `36` | `24` |
 | `margin_x`, `margin_y` | distance from the screen edges | `10`, `10` |
 | `visible` | `1` shows the overlay, `0` hides it | `1` |
+| `opacity` | `10` to `100`, how strong the text is | `100` |
+| `rotate` | minutes between moves to the next corner, clockwise from `corner`; `0` stays put | `0` |
 
 With `labels=auto` the fps number is always bare, and the other lines get a name when more than one
 line is shown. All six lines, `show=fps,frametime,min,max,avg,time`, look like this:
@@ -92,6 +98,20 @@ TIME  1:23
 - A line the overlay does not understand keeps its default. Deleting the file brings all defaults back.
 - The font cannot be measured from outside the home screen, so the columns are placed by estimated
   letter widths. If names and values sit too close or too far apart, that estimate is what to adjust.
+
+## OLED screens
+
+A white number that sits in one place for hours a day is the kind of thing that leaves a mark on an
+OLED panel. Two settings are there for that:
+
+- `opacity=50` draws the text at half strength, so the pixels under it work half as hard.
+- `rotate=30` moves the overlay to the next corner every 30 minutes, clockwise from `corner`, so the
+  hours are spread over four spots. Saving the settings file starts the round again from `corner`, and
+  the log notes each move as `Rotate corner=...`.
+
+A smaller `font_size` and larger margins help too. With `opacity=50`, `rotate=30` and `font_size=18`
+the overlay is about as gentle as an always-on overlay gets; the screen's own pixel shift and logo
+detection do the rest.
 
 ## What it does to the console
 
@@ -123,6 +143,8 @@ home screen kept running. A fault in this kind of code can still make the home s
 - Settings are read from `/data/simplefps.ini`. Common FPS has a settings parser but never opens a file.
 - The overlay can show several lines. The controller writes the text and colour of each line into the
   packet it sends to the renderer once a second; the renderer only places and draws them.
+- Text opacity and timed corner rotation, for OLED screens. Both happen in the controller: the
+  renderer draws whatever colour and corner the packet carries.
 - Both programs import exactly the same system functions as in the first SimpleFPS release.
 
 ## Build

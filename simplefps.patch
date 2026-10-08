@@ -1,6 +1,6 @@
 --- a/include/common_fps/config.hpp
 +++ b/include/common_fps/config.hpp
-@@ -7,14 +7,22 @@
+@@ -7,14 +7,25 @@
  
  #pragma once
  #include "common_fps/types.hpp"
@@ -23,6 +23,9 @@
 +
  const char* corner_name(Corner corner);
 +const char* item_name(OverlayItem item);
++
++/* The corner reached after "steps" moves clockwise from "start". */
++Corner rotated_corner(Corner start, unsigned steps);
  
  } // namespace common_fps
 --- a/include/common_fps/layout.hpp
@@ -135,7 +138,7 @@
  #include <cstdint>
  #include <string>
  
-@@ -25,11 +26,47 @@ struct Vec2 {
+@@ -25,11 +26,49 @@ struct Vec2 {
      float y{};
  };
  
@@ -173,6 +176,8 @@
 +    bool color = false;
 +    int fps_good = 55;
 +    int fps_ok = 30;
++    int opacity = 100;      // of the text, in percent
++    int rotate_minutes = 0; // move to the next corner this often; 0 stays put
 +};
 +
 +/* Text and 0xRRGGBBAA colours, ready to draw. An empty label draws nothing. */
@@ -184,7 +189,7 @@
  };
  
  struct OverlayFrame {
-@@ -38,6 +75,8 @@ struct OverlayFrame {
+@@ -38,6 +77,8 @@ struct OverlayFrame {
      int fps = 0;
      OverlayConfig config{};
      Vec2 anchor{};
@@ -242,7 +247,7 @@
      "${ROOT}/src/ps5/ps5_platform.cpp"
 --- a/src/core/config.cpp
 +++ b/src/core/config.cpp
-@@ -9,34 +9,214 @@
+@@ -9,81 +9,326 @@
  #include "common_fps/constants.hpp"
  
  #include <algorithm>
@@ -262,6 +267,9 @@
 +constexpr int kMinFpsThreshold = 1;
 +constexpr int kMaxFpsThreshold = 240;
 +constexpr float kMaxMargin = 400.0f;
++constexpr int kMinOpacity = 10;
++constexpr int kMaxOpacity = 100;
++constexpr int kMaxRotateMinutes = 24 * 60;
 +
 +bool is_space(char c) {
 +    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
@@ -443,6 +451,16 @@
 +            cfg.fps_ok = std::clamp(
 +                static_cast<int>(number), kMinFpsThreshold, kMaxFpsThreshold);
 +        }
++    } else if (same_word(key, "opacity")) {
++        if (parse_number(value, number)) {
++            cfg.opacity = std::clamp(
++                static_cast<int>(number), kMinOpacity, kMaxOpacity);
++        }
++    } else if (same_word(key, "rotate")) {
++        if (parse_number(value, number)) {
++            cfg.rotate_minutes = std::clamp(
++                static_cast<int>(number), 0, kMaxRotateMinutes);
++        }
 +    }
 +}
 +
@@ -473,7 +491,22 @@
      }
  }
  
-@@ -46,44 +226,74 @@ OverlayConfig default_config() {
++Corner rotated_corner(Corner start, unsigned steps) {
++    constexpr Corner clockwise[] = {
++        Corner::TopLeft,
++        Corner::TopRight,
++        Corner::BottomRight,
++        Corner::BottomLeft,
++    };
++    unsigned index = 0;
++    while (index < 3 && clockwise[index] != start)
++        ++index;
++    return clockwise[(index + steps) % 4];
++}
++
+ OverlayConfig default_config() {
+     return {};
+ }
  
  OverlayConfig parse_config_text(std::string_view text) {
      OverlayConfig cfg = default_config();
@@ -572,7 +605,16 @@
 +        "margin_y=10\n"
 +        "\n"
 +        "# visible=0 hides the overlay, visible=1 shows it\n"
-+        "visible=1\n";
++        "visible=1\n"
++        "\n"
++        "# For OLED screens. Both are off by default.\n"
++        "# opacity: how strong the text is, 10 to 100. At 50 the pixels\n"
++        "# under the number work half as hard.\n"
++        "opacity=100\n"
++        "# rotate=N moves the overlay to the next corner every N minutes,\n"
++        "# clockwise from the corner above, so no spot wears alone.\n"
++        "# 0 keeps it still. Saving this file starts again from that corner.\n"
++        "rotate=0\n";
  }
  
  } // namespace common_fps
@@ -682,7 +724,7 @@
      const float width = static_cast<float>(cfg.font_size) * 5.2f;
 --- /dev/null
 +++ b/src/core/overlay_rows.cpp
-@@ -0,0 +1,142 @@
+@@ -0,0 +1,150 @@
 +/*
 + * SimpleFPS addition to Common FPS for PS5
 + *
@@ -708,6 +750,11 @@
 +constexpr std::uint32_t kFrameTimeName = 0x33b5ffffU;
 +constexpr std::uint32_t kStatsName = 0x4cd964ffU;
 +constexpr std::uint32_t kTimeName = 0xff7eb6ffU;
++
++/* Replaces the alpha byte of an 0xRRGGBBAA colour. */
++std::uint32_t with_alpha(std::uint32_t rgba, std::uint32_t alpha) {
++    return (rgba & 0xffffff00U) | (alpha & 0xffU);
++}
 +
 +struct ItemStyle {
 +    const char* name;
@@ -783,6 +830,8 @@
 +    const bool all_named = cfg.labels == LabelMode::On;
 +    const bool others_named = cfg.labels == LabelMode::Auto && count > 1;
 +    const bool have_stats = !readings.stats.empty();
++    const std::uint32_t alpha = static_cast<std::uint32_t>(
++        std::clamp(cfg.opacity, 1, 100) * 255 / 100);
 +
 +    frame.row_count = count;
 +    for (std::size_t i = 0; i < count; ++i) {
@@ -790,8 +839,8 @@
 +        const ItemStyle style = style_of(item);
 +        OverlayRow& row = frame.rows[i];
 +        row = OverlayRow{};
-+        row.label_rgba = style.name_rgba;
-+        row.value_rgba = style.value_rgba;
++        row.label_rgba = with_alpha(style.name_rgba, alpha);
++        row.value_rgba = with_alpha(style.value_rgba, alpha);
 +        if (all_named || (others_named && item != OverlayItem::Fps))
 +            std::snprintf(row.label, kOverlayLabelSize, "%s", style.name);
 +
@@ -799,10 +848,11 @@
 +            case OverlayItem::Fps:
 +                write_number(row.value, readings.have_fps, readings.fps);
 +                if (cfg.color && readings.have_fps) {
-+                    row.value_rgba =
++                    row.value_rgba = with_alpha(
 +                        readings.fps >= cfg.fps_good ? kGood
 +                        : readings.fps >= cfg.fps_ok ? kOk
-+                        : kBad;
++                        : kBad,
++                        alpha);
 +                }
 +                break;
 +            case OverlayItem::FrameTime:
@@ -895,7 +945,7 @@
  constexpr std::uint64_t kDceVideoOutStandbyUs = 60'000'000ULL;
  constexpr unsigned kDceMissesBeforeVideoOutWake = 3;
  
-@@ -303,9 +317,236 @@ void append_first_fps_record(
+@@ -303,9 +317,263 @@ void append_first_fps_record(
      (void)close(fd);
  }
  
@@ -932,7 +982,7 @@
 +        sizeof(record),
 +        "Settings source=%s path=%s corner=%s show=%s labels=%d color=%d "
 +        "fps_good=%d fps_ok=%d font_size=%d margin_x=%d margin_y=%d "
-+        "visible=%d\n",
++        "visible=%d opacity=%d rotate=%d\n",
 +        source,
 +        kSettingsPath,
 +        common_fps::corner_name(cfg.corner),
@@ -944,7 +994,9 @@
 +        cfg.font_size,
 +        static_cast<int>(cfg.margin_x),
 +        static_cast<int>(cfg.margin_y),
-+        cfg.visible ? 1 : 0);
++        cfg.visible ? 1 : 0,
++        cfg.opacity,
++        cfg.rotate_minutes);
 +
 +    if (record_size > 0) {
 +        const std::size_t safe_size =
@@ -953,6 +1005,28 @@
 +                : sizeof(record) - 1;
 +        write_all(fd, record, safe_size);
 +    }
++
++    (void)fsync(fd);
++    (void)close(fd);
++}
++
++void append_rotate_record(common_fps::Corner corner) noexcept {
++    const int fd = open(
++        kControllerLog,
++        O_WRONLY | O_CREAT | O_APPEND | O_SYNC,
++        0644);
++    if (fd < 0)
++        return;
++
++    char record[64]{};
++    const int record_size = std::snprintf(
++        record,
++        sizeof(record),
++        "Rotate corner=%s\n",
++        common_fps::corner_name(corner));
++    if (record_size > 0 &&
++        static_cast<std::size_t>(record_size) < sizeof(record))
++        write_all(fd, record, static_cast<std::size_t>(record_size));
 +
 +    (void)fsync(fd);
 +    (void)close(fd);
@@ -1016,7 +1090,8 @@
 +    return true;
 +}
 +
-+void refresh_settings(
++/* True when cfg was replaced: the file changed, appeared or went missing. */
++bool refresh_settings(
 +    SettingsFile& file,
 +    common_fps::OverlayConfig& cfg) noexcept {
 +
@@ -1026,19 +1101,20 @@
 +
 +    if (result == SettingsRead::Failed) {
 +        /* A read that failed half way says nothing: keep the settings in use. */
-+        return;
++        return false;
 +    }
 +
 +    if (result == SettingsRead::Missing) {
++        const bool replaced = file.loaded || !file.defaults_logged;
 +        if (!file.create_failed)
 +            file.create_failed = !write_default_settings_file();
-+        if (file.loaded || !file.defaults_logged) {
++        if (replaced) {
 +            cfg = common_fps::default_config();
 +            append_settings_record("defaults", cfg);
 +        }
 +        file.loaded = false;
 +        file.defaults_logged = true;
-+        return;
++        return replaced;
 +    }
 +
 +    /* Compared by hand: the controller imports nothing Common FPS did not. */
@@ -1046,13 +1122,14 @@
 +    for (std::size_t i = 0; unchanged && i < size; ++i)
 +        unchanged = text[i] == file.text[i];
 +    if (unchanged)
-+        return;
++        return false;
 +
 +    std::memcpy(file.text, text, size);
 +    file.size = size;
 +    file.loaded = true;
 +    cfg = common_fps::parse_config_text(std::string_view(text, size));
 +    append_settings_record("file", cfg);
++    return true;
 +}
 +
 +void claim_overlay() noexcept {
@@ -1132,7 +1209,7 @@
  
      common_fps::ps5::Ps5Platform platform;
      common_fps::FpsSampler sampler(platform);
-@@ -325,7 +566,10 @@ void append_first_fps_record(
+@@ -325,7 +593,13 @@ void append_first_fps_record(
      bool have_fps = false;
      int latest_fps = 0;
      std::uint64_t sequence = 1;
@@ -1141,10 +1218,13 @@
 +    SettingsFile settings_file;
 +    common_fps::FpsStats session_stats;
 +    std::uint64_t session_start_us = 0;
++    /* Corner rotation: how many corners on from the configured one, since when. */
++    unsigned rotate_steps = 0;
++    std::uint64_t rotate_since_us = platform.monotonic_us();
  
      /*
       * The controller remains in etaHEN's tracked process: no second fork,
-@@ -334,6 +578,18 @@ void append_first_fps_record(
+@@ -334,6 +608,35 @@ void append_first_fps_record(
       * injection.  A changed PID after rest mode restarts the same gate.
       */
      for (;;) {
@@ -1158,12 +1238,29 @@
 +                platform.sleep_ms(60000);
 +        }
 +
-+        refresh_settings(settings_file, overlay_config);
++        if (refresh_settings(settings_file, overlay_config)) {
++            rotate_steps = 0;
++            rotate_since_us = platform.monotonic_us();
++        }
++        if (overlay_config.rotate_minutes > 0) {
++            const std::uint64_t now_us = platform.monotonic_us();
++            const std::uint64_t period_us =
++                static_cast<std::uint64_t>(overlay_config.rotate_minutes) *
++                60'000'000ULL;
++            if (now_us - rotate_since_us >= period_us) {
++                rotate_steps = (rotate_steps + 1) % 4;
++                rotate_since_us = now_us;
++                append_rotate_record(common_fps::rotated_corner(
++                    overlay_config.corner, rotate_steps));
++            }
++        } else {
++            rotate_steps = 0;
++        }
 +
          const ShellUiObservation shellui = observe_shellui_once();
          if (shellui.pid > 0) {
              if (shellui.pid == stable_shellui_pid) {
-@@ -367,6 +623,8 @@ void append_first_fps_record(
+@@ -367,6 +670,8 @@ void append_first_fps_record(
              } else {
                  stable_game_pid = *observed_game_pid;
                  stable_game_observations = 1;
@@ -1172,7 +1269,7 @@
  
                  sampler.reset();
                  reported_pid = -1;
-@@ -381,6 +639,8 @@ void append_first_fps_record(
+@@ -381,6 +686,8 @@ void append_first_fps_record(
          } else {
              stable_game_pid = -1;
              stable_game_observations = 0;
@@ -1181,7 +1278,7 @@
  
              sampler.reset();
              reported_pid = -1;
-@@ -504,6 +764,9 @@ void append_first_fps_record(
+@@ -504,13 +811,28 @@ void append_first_fps_record(
                  common_fps::ps5::ensure_shellui_renderer();
          }
  
@@ -1191,9 +1288,11 @@
          if (renderer_online) {
              common_fps::OverlayFrame frame{};
              frame.visible = true;
-@@ -511,6 +774,16 @@ void append_first_fps_record(
+             frame.loading = !have_fps;
              frame.fps = latest_fps;
              frame.config = overlay_config;
++            frame.config.corner = common_fps::rotated_corner(
++                overlay_config.corner, rotate_steps);
              frame.anchor = common_fps::compute_anchor(frame.config);
 +
 +            common_fps::OverlayReadings readings{};
