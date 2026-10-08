@@ -28,6 +28,19 @@
 +Corner rotated_corner(Corner start, unsigned steps);
  
  } // namespace common_fps
+--- a/include/common_fps/constants.hpp
++++ b/include/common_fps/constants.hpp
+@@ -37,6 +37,10 @@ inline constexpr int kDefaultFontSize = 24;
+ inline constexpr int kMinFontSize = 18;
+ inline constexpr int kMaxFontSize = 36;
+ 
++/* Margins may be negative, to pull the text past the font's own padding. */
++inline constexpr float kMinMargin = -100.0f;
++inline constexpr float kMaxMargin = 400.0f;
++
+ /* Hardware-proven v11 filter: PS5 output is at most 120 Hz. */
+ inline constexpr std::uint32_t kMaxTenthsFps = 1300;
+ 
 --- a/include/common_fps/layout.hpp
 +++ b/include/common_fps/layout.hpp
 @@ -12,4 +12,22 @@ namespace common_fps {
@@ -247,7 +260,7 @@
      "${ROOT}/src/ps5/ps5_platform.cpp"
 --- a/src/core/config.cpp
 +++ b/src/core/config.cpp
-@@ -9,81 +9,326 @@
+@@ -9,81 +9,328 @@
  #include "common_fps/constants.hpp"
  
  #include <algorithm>
@@ -266,7 +279,6 @@
 +
 +constexpr int kMinFpsThreshold = 1;
 +constexpr int kMaxFpsThreshold = 240;
-+constexpr float kMaxMargin = 400.0f;
 +constexpr int kMinOpacity = 10;
 +constexpr int kMaxOpacity = 100;
 +constexpr int kMaxRotateMinutes = 24 * 60;
@@ -306,8 +318,11 @@
 +    return true;
  }
  
-+/* Plain decimal such as "24" or "10.5"; anything else is rejected. */
++/* Plain decimal such as "24", "-6" or "10.5"; anything else is rejected. */
 +bool parse_number(std::string_view value, double& out) {
++    const bool negative = !value.empty() && value.front() == '-';
++    if (negative)
++        value.remove_prefix(1);
 +    if (value.empty() || value.size() > 9)
 +        return false;
 +
@@ -335,7 +350,7 @@
 +
 +    if (!digits)
 +        return false;
-+    out = whole + fraction;
++    out = negative ? -(whole + fraction) : whole + fraction;
 +    return true;
 +}
 +
@@ -434,12 +449,12 @@
 +    } else if (same_word(key, "margin_x")) {
 +        if (parse_number(value, number)) {
 +            cfg.margin_x = std::clamp(
-+                static_cast<float>(number), 0.0f, kMaxMargin);
++                static_cast<float>(number), kMinMargin, kMaxMargin);
 +        }
 +    } else if (same_word(key, "margin_y")) {
 +        if (parse_number(value, number)) {
 +            cfg.margin_y = std::clamp(
-+                static_cast<float>(number), 0.0f, kMaxMargin);
++                static_cast<float>(number), kMinMargin, kMaxMargin);
 +        }
 +    } else if (same_word(key, "fps_good")) {
 +        if (parse_number(value, number)) {
@@ -600,7 +615,7 @@
 +        "# Text size, 18 to 36\n"
 +        "font_size=24\n"
 +        "\n"
-+        "# Distance from the screen edges\n"
++        "# Distance from the screen edges to the text, -100 to 400\n"
 +        "margin_x=10\n"
 +        "margin_y=10\n"
 +        "\n"
@@ -620,7 +635,7 @@
  } // namespace common_fps
 --- a/src/core/layout.cpp
 +++ b/src/core/layout.cpp
-@@ -8,8 +8,101 @@
+@@ -8,8 +8,107 @@
  #include "common_fps/layout.hpp"
  #include "common_fps/constants.hpp"
  
@@ -630,8 +645,13 @@
  
 +namespace {
 +
-+/* Same single-line box as compute_anchor, and the step between two rows. */
-+constexpr float kRowBoxHeight = 1.45f;
++/*
++ * Where the digits sit inside the text box, in font sizes from its top. The
++ * font cannot be measured from here: estimated from a photo of the overlay.
++ */
++constexpr float kTextTop = 0.42f;
++constexpr float kTextBottom = 1.14f;
++/* Step between two rows. */
 +constexpr float kRowStep = 1.30f;
 +constexpr float kLabelGap = 0.50f;
 +/* The value column never gets narrower than three digits, so names stay put. */
@@ -696,10 +716,11 @@
 +    const float step = font * kRowStep;
 +    const float rows_above =
 +        count > 0 ? static_cast<float>(count - 1) : 0.0f;
++    /* margin_y counts to the digits themselves, not to the box around them. */
 +    const float top = is_bottom_corner(cfg.corner)
-+        ? kLogicalHeight - cfg.margin_y - font * kRowBoxHeight -
++        ? kLogicalHeight - cfg.margin_y - font * kTextBottom -
 +              rows_above * step
-+        : cfg.margin_y;
++        : cfg.margin_y - font * kTextTop;
 +
 +    for (std::size_t i = 0; i < kMaxOverlayRows; ++i) {
 +        RowPosition& row = out[i];
@@ -877,7 +898,21 @@
 +} // namespace common_fps
 --- a/src/core/wire.cpp
 +++ b/src/core/wire.cpp
-@@ -46,6 +46,13 @@ WirePacket make_wire_packet(
+@@ -13,6 +13,13 @@
+ 
+ namespace common_fps {
+ 
++/* The packet is never trusted: an odd value becomes the default. */
++static float decode_margin(float value) {
++    if (value != value)
++        return 0.0f;
++    return std::clamp(value, kMinMargin, kMaxMargin);
++}
++
+ static std::uint8_t encode_corner(Corner corner) {
+     switch (corner) {
+         case Corner::TopLeft: return 0;
+@@ -46,6 +53,13 @@ WirePacket make_wire_packet(
          std::clamp(frame.config.font_size, kMinFontSize, kMaxFontSize));
      packet.margin_x = frame.config.margin_x;
      packet.margin_y = frame.config.margin_y;
@@ -891,9 +926,14 @@
      return packet;
  }
  
-@@ -83,6 +90,14 @@ decode_wire_packet(const WirePacket& packet) {
-     frame.config.margin_x = std::max(0.0f, packet.margin_x);
-     frame.config.margin_y = std::max(0.0f, packet.margin_y);
+@@ -80,9 +94,17 @@ decode_wire_packet(const WirePacket& packet) {
+         static_cast<int>(packet.font_size),
+         kMinFontSize,
+         kMaxFontSize);
+-    frame.config.margin_x = std::max(0.0f, packet.margin_x);
+-    frame.config.margin_y = std::max(0.0f, packet.margin_y);
++    frame.config.margin_x = decode_margin(packet.margin_x);
++    frame.config.margin_y = decode_margin(packet.margin_y);
      frame.anchor = compute_anchor(frame.config);
 +
 +    frame.row_count = std::min<std::size_t>(packet.row_count, kMaxOverlayRows);

@@ -25,7 +25,10 @@ loaded through the ELF loader on port 9021.
 - With the default settings the overlay asks the home screen for the same things as the first release:
   one text, updated once a second.
 - 11.xx, 12.xx and 13.00 to 13.50 are allowed by the patch but have not been tried by anyone.
-- v1.2 adds `opacity` and `rotate`. The build is checked, but neither has been seen on screen yet.
+- v1.2 added `opacity` and `rotate`. Both were seen working there, and sending v1.2 over a running
+  v1.1 was seen to take the overlay over without a restart.
+- v1.3 puts the text where `margin_y` says, by an estimate of the font's padding, and allows negative
+  margins. The build is checked, but it has not been seen on screen yet.
 
 Use it at your own risk.
 
@@ -52,12 +55,11 @@ Things to know:
   home screen.
 - `visible=0` in the settings hides it. The overlay itself keeps running until a restart.
 - Do not run it together with Common FPS itself or with another FPS overlay.
-- Launch it once. Two copies drawing at the same time show as flickering numbers. From this version on
-  a second launch should be harmless, because the newer copy takes the overlay over and the older one
-  goes quiet, but that has not been tried on a console yet.
-- A new build needs a restart of the console first, because the drawing part stays in the home screen.
-  Coming from v1.1 that should not be necessary: v1.2 changes the controller only, and the packets the
-  drawing part receives are the same. This has not been tried.
+- A second launch is harmless: the newer copy takes the overlay over and the older one goes quiet.
+  Two copies drawing at the same time would show as flickering numbers.
+- A new build that changes the drawing part needs a restart of the console first, because that part
+  stays in the home screen. v1.3 changes it, so coming from any earlier version, restart first. (v1.2
+  did not, and was seen taking over from a running v1.1 without one.)
 - It writes a log to `/data/CommonFPS_v1_2_1.log`. Each time it reads the settings, it notes there what
   it understood.
 
@@ -76,7 +78,7 @@ that runs in a sandbox has its own `/data` and does not see the file.
 | `color` | `1` paints the fps number green, yellow or red; `0` keeps it white | `0` |
 | `fps_good`, `fps_ok` | green from `fps_good` up, yellow from `fps_ok` up, red below | `55`, `30` |
 | `font_size` | `18` to `36` | `24` |
-| `margin_x`, `margin_y` | distance from the screen edges | `10`, `10` |
+| `margin_x`, `margin_y` | distance from the screen edges to the text, `-100` to `400` | `10`, `10` |
 | `visible` | `1` shows the overlay, `0` hides it | `1` |
 | `opacity` | `10` to `100`, how strong the text is | `100` |
 | `rotate` | minutes between moves to the next corner, clockwise from `corner`; `0` stays put | `0` |
@@ -98,6 +100,9 @@ TIME  1:23
 - A line the overlay does not understand keeps its default. Deleting the file brings all defaults back.
 - The font cannot be measured from outside the home screen, so the columns are placed by estimated
   letter widths. If names and values sit too close or too far apart, that estimate is what to adjust.
+- The same goes for the space the font keeps above and below the digits. `margin_y` counts to the digits
+  by an estimate taken from a photo; if the text still sits too low or too high, a negative or larger
+  `margin_y` corrects it, and that number is what the estimate should become.
 
 ## OLED screens
 
